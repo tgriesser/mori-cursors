@@ -154,11 +154,11 @@ module.exports = function(mori) {
   inherits(VectorCursor, Cursor);
 
   VectorCursor.prototype.first = function() {
-    return toCursor(mori.first(this.value), this.root);
+    return toCursor(mori.first(this.value), this.root, mori.conj1(this.path, 0));
   };
 
   VectorCursor.prototype.rest = function() {
-    return toCursor(mori.rest(this.value), this.root);
+    return toCursor(mori.rest(this.value), this.root, this.path);
   };
 
   VectorCursor.prototype.conj = function(o) {
@@ -167,9 +167,9 @@ module.exports = function(mori) {
 
   VectorCursor.prototype.seq = function() {
     if (mori.count(this) > 0) {
-      return mori.map((function(_this) {
+      return mori.map((function(cursor) {
         return function(v, i) {
-          return toCursor(v, _this.root, mori.conj(_this.path, i));
+          return toCursor(v, cursor.root, mori.conj1(cursor.path, i));
         };
       })(this), this.value, mori.range());
     }
@@ -304,9 +304,9 @@ module.exports = function(mori) {
 
   RootCursor.prototype.swap = function(path, state, f) {
     if (mori.is_empty(path)) {
-      this.value = toCursor(f(this.value), this);
+      this.value = f(this.value);
     } else {
-      this.value = toCursor(mori.update_in(state, path, f), this);
+      this.value = mori.update_in(state, path, f);
     }
     return this.value;
   };
