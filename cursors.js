@@ -239,7 +239,7 @@ module.exports = function(mori) {
     }
     var oldRoot = root.value;
     var path = mori.into(cursor.path, korks);
-    var ret = root.swap(path, root, f);
+    var ret  = root.swap(path, f);
     var tx_data = mori.hash_map(
       'path', path,
       'old-value', mori.get_in(oldRoot, path),
@@ -302,11 +302,11 @@ module.exports = function(mori) {
   }
   inherits(RootCursor, MapCursor);
 
-  RootCursor.prototype.swap = function(path, state, f) {
+  RootCursor.prototype.swap = function(path, f) {
     if (mori.is_empty(path)) {
       this.value = f(this.value);
     } else {
-      this.value = mori.update_in(state, path, f);
+      this.value = mori.update_in(this.value, path, f);
     }
     return this.value;
   };
