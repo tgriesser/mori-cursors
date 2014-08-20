@@ -32,6 +32,10 @@ module.exports = function(mori) {
     return mori.count(this.value);
   };
 
+  Cursor.prototype.map = function(fn) {
+    return mori.map(fn, this);
+  };
+
   Cursor.prototype.get = function(k, notFound) {
     if (Array.isArray(k)) {
       return mori.get_in(this, k, notFound);
@@ -41,13 +45,11 @@ module.exports = function(mori) {
   };
 
   Cursor.prototype.lookup = function(k, notFound) {
-    var val;
-    val = mori.get(this.value, k, notFound);
+    var val = mori.get(this.value, k, notFound);
     if (!mori.equals(val, notFound)) {
       return toCursor(val, this.root, mori.conj(this.path, k));
-    } else {
-      return notFound;
     }
+    return notFound;
   };
 
   Cursor.prototype.assoc = function(k, v) {
@@ -104,6 +106,50 @@ module.exports = function(mori) {
         };
       })(this), this.value);
     }
+  };
+
+  // "Transact" the current value of the cursor, returning a
+  // hash of `oldValue`, `newValue`, `oldRoot`, 
+  // `newRoot`, `path`, `tag`
+  Cursor.prototype.transact = function(keyOrKeys, fn, tag) {
+    switch (arguments.length) {
+      case 1: return this.transact(null, keyOrKeys, null);
+      case 2: return this.transact(keyOrKeys, fn, null);
+    }
+    var path = normalizePath(this.path, keyOrKeys);
+    return _transact(this.root, this, path, fn, tag);
+  };
+
+  // Update the cursor, calling `cursor.transact`
+  // but just changing the value.
+  Cursor.prototype.update = function(keyOrKeys, v, tag) {
+    if (arguments.length === 1) {
+      return this.transact([], function() {
+        return keyOrKeys;
+      });
+    }
+    return this.transact(keyOrKeys, function() {
+      return v;
+    }, tag);
+  };
+
+  // Calls "swap", which swaps out the underlying value of the cursor but 
+  // doesn't trigger any events / updates. Returns the updated cursor.
+  Cursor.prototype.swap = function(keyOrKeys, fn) {
+    if (arguments.length === 1) return this.swap(null, keyOrKeys);
+    var path = normalizePath(this.path, keyOrKeys);
+    var newRootVal = _swap(this.root, path, fn);
+    return toCursor(mori.get_in(newRootVal, this.path), this.root, this.path);
+  };
+
+  // Like swap, but takes a key / value rather than a fn.
+  Cursor.prototype.set = function(keyOrKeys, val) {
+    if (arguments.length === 1) return this.swap(null, keyOrKeys);
+    var path = normalizePath(this.path, keyOrKeys);
+    var newRootVal = _swap(this.root, path, function() {
+      return val;
+    });
+    return toCursor(mori.get_in(newRootVal, this.path), this.root, this.path);
   };
 
   mori.extend("ILookup", Cursor.prototype, {
@@ -175,6 +221,10 @@ module.exports = function(mori) {
     }
   };
 
+  VectorCursor.prototype.reduce = function(fn, acc) {
+    return mori.reduce(fn, acc, this);
+  };
+
   // Create a new MapCursor, allowing for plain objects to be passed in
   // and converted to a new MapCursor.
   function MapCursor(value, root, path) {
@@ -196,6 +246,10 @@ module.exports = function(mori) {
     return toCursor(mori.dissoc(this.value, k), this.root, this.path);
   };
 
+  MapCursor.prototype.reduce = function(fn, acc) {
+    return mori.reduce_kv(fn, acc, this);
+  };
+
   // "extend" the MapCursor with various MapCursor specific protocols.
   mori.extend("IMap", MapCursor.prototype, {
     dissoc: MapCursor.prototype.dissoc
@@ -211,72 +265,42 @@ module.exports = function(mori) {
     rest: VectorCursor.prototype.rest
   });
 
-  function transact(cursor, korks, f, tag) {
-    if (arguments.length === 2) {
-      return transact(cursor, null, korks, null);
-    }
-    if (arguments.length === 3) {
-      return transact(cursor, korks, f, null);
-    }
-    if (korks === null) {
-      korks = mori.vector();
-    }
-    if (Array.isArray(korks)) {
-      korks = mori.js_to_clj(korks);
-    }
-    if (!mori.is_sequential(korks)) {
-      korks = mori.vector(korks);
-    }
-    return _transact(cursor.root, cursor, korks, f, tag);
-  }
-
-  function _transact(root, cursor, korks, f, tag) {
-    if (!(cursor instanceof Cursor)) {
-      throw new Error("Only cursors can be used with app.update / app.transact");
-    }
-    if (korks instanceof Cursor) {
-      throw new Error("Invalid arguments passed to update / transact");
+  // Update a value in a pseudo-transaction. The updated value
+  // is determined and sent as tx_data 
+  function _transact(root, cursor, path, fn, tag) {
+    if (typeof fn !== "function") {
+      throw new Error('A function is required for cursor transact / update');
     }
     var oldRoot = root.value;
-    var path = mori.into(cursor.path, korks);
-    var ret  = root.swap(path, f);
+    var newRoot = _swap(root, path, fn);
     var tx_data = mori.hash_map(
-      'path', path,
-      'old-value', mori.get_in(oldRoot, path),
-      'new-value', mori.get_in(ret, path),
-      'old-root', oldRoot,
-      'new-root', ret
+      'path',     path,
+      'oldValue', mori.get_in(oldRoot, path),
+      'newValue', mori.get_in(newRoot, path),
+      'oldRoot',  oldRoot,
+      'newRoot',  newRoot,
+      'tag',      tag
     );
-    if (tag != null) tx_data = mori.assoc('tag', tag);
-    return root.emit('transact', cursor, tx_data);
+    root.emit('transact', tx_data, cursor);
+    return tx_data;
   }
-
-  function update(cursor, korks, v, tag) {
-    if (arguments.length === 2) {
-      return transact(cursor, [], (function() {
-        return korks;
-      }), null);
+  
+  // Shared helper for the internal "swap!"
+  function _swap(root, path, fn) {
+    if (mori.is_empty(path)) {
+      root.value = fn(root.value);
+    } else {
+      root.value = mori.update_in(root.value, path, fn);
     }
-    if (arguments.length === 3) {
-      return transact(cursor, korks, (function() {
-        return v;
-      }), null);
-    }
-    return transact(cursor, korks, (function() {
-      return v;
-    }), tag);
+    return root.value;
   }
 
   function toCursor(val, root, path) {
     switch (arguments.length) {
-      case 1:
-        throw new Error('The root is required to build a cursor');
-      case 2:
-        return toCursor(val, root, []);
+      case 1: throw new Error('The root is required to build a cursor');
+      case 2: return toCursor(val, root, []);
     }
-    if (val instanceof Cursor) {
-      return val;
-    }
+    if (val instanceof Cursor) return val;
     if (val != null && typeof val.toCursor === 'function') {
       return val.toCursor(root, path);
     }
@@ -293,27 +317,26 @@ module.exports = function(mori) {
   // exposing a "swap" method which allows updating the value in place. The
   // root cursor.
   function RootCursor(data) {
-    if (!isPlainObject(data)) {
-      throw new Error('The root cursor takes a plain javascript object');
+    if (isPlainObject(data) || Array.isArray(data)) {
+      data = mori.js_to_clj(data);
     }
-    this.value = mori.js_to_clj(data);
+    this.value = data;
     this.root  = this;
     this.path  = mori.vector();
   }
   inherits(RootCursor, MapCursor);
 
-  RootCursor.prototype.swap = function(path, f) {
-    if (mori.is_empty(path)) {
-      this.value = f(this.value);
-    } else {
-      this.value = mori.update_in(this.value, path, f);
-    }
-    return this.value;
-  };
-
   // Make the RootCursor an EventEmitter.
   for (var k in EventEmitter.prototype) {
     RootCursor.prototype[k] = EventEmitter.prototype[k];
+  }
+
+  // Normalizes key or keys passed to any of the update / transact / swap.
+  function normalizePath(path, keyOrKeys) {
+    if (keyOrKeys == null) return path;
+    if (Array.isArray(keyOrKeys)) keyOrKeys = mori.js_to_clj(keyOrKeys);
+    if (!mori.is_sequential(keyOrKeys)) keyOrKeys = mori.vector(keyOrKeys);
+    return mori.into(path, keyOrKeys);
   }
 
   // Cursor namespace
@@ -330,8 +353,6 @@ module.exports = function(mori) {
     return new RootCursor(data);
   };
   mori.cursor.toCursor  = toCursor;
-  mori.cursor.update    = update;
-  mori.cursor.transact  = transact;
 
   return mori;
 };
